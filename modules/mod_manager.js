@@ -3,6 +3,7 @@ const path = global.path;
 const os = global.os;
 
 const { dialog } = require('electron');
+const isDev = require("electron-is-dev");
 const https = require('https');
 const JSZip = require('jszip');
 const url = require("url");
@@ -13,6 +14,7 @@ const {GithubSource} = require("./mod_sources/github_source.js");
 const {JsonListSource} = require("./mod_sources/jsonlist_source.js");
 const {GameBananaSource} = require("./mod_sources/gamebanana_source.js");
 const {CreatorsDepotClient} = require("./depot/creators_depot_client");
+const {CreatorsDepotProxy, CreatorsDepotProxyMock, CreatorsDepotProxyCacheWrapper} = require("./depot/Proxies");
 
 var functionMap = new Map();
 
@@ -101,7 +103,8 @@ ChangeCurrentMod(name){
         }
 
         if(isDepot){
-            this.depotClient = new CreatorsDepotClient(this.GetRealTF2Path());
+            const proxy = isDev ? new CreatorsDepotProxyMock() : new CreatorsDepotProxyCacheWrapper(new CreatorsDepotProxy());
+            this.depotClient = new CreatorsDepotClient(this.GetRealTF2Path(), proxy);
             this.depotClient.CheckForUpdates().then((needsUpdate) => {
                 resolve(needsUpdate ? "Update" : "Installed");
             }).catch(reject);

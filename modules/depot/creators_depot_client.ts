@@ -1,19 +1,17 @@
-import https from "https";
 import fs from "fs";
 import _crypto from "crypto";
 import path from "path";
+const log = require("electron-log");
 const ProgressBar = require("electron-progressbar");
-const strf = require('string-format');
-import { Worker } from 'worker_threads';
+import { Worker, MessagePort, MessageChannel } from 'worker_threads';
 import {ChecksumWorkerData} from "./ChecksumWorkerData";
 import { Utilities } from "../utilities";
+import ICreatorsDepotProxy from "./Proxies/ICreatorsDepotProxy";
 
 //Checks for updates of local files based on their md5 hash.
 class CreatorsDepotClient {
 
-    private allContentURL = "https://creators.tf/api/IDepots/GVersionInfo?depid=1&tags=content";
-    private downloadRequestURL = "https://creators.tf/api/IDepots/GDownloadFile?depid=1&file={0}";
-    private allDepotData : string | undefined;
+    private proxy : ICreatorsDepotProxy;
     private modPath : string;
     private filesToUpdate : Array<ChecksumWorkerData> = [];
     private MaxConcurrentDownloads = 3;
@@ -21,124 +19,106 @@ class CreatorsDepotClient {
     private currentDownloads = 0;
     private workerThreadCount = 6;
 
-    constructor(modpath : string){
+    constructor(modpath : string, proxy : ICreatorsDepotProxy){
         this.modPath = modpath;
+        this.proxy = proxy;
     }
 
     public CheckForUpdates() : Promise<boolean> {
         return new Promise(async (resolve, reject) => {
             var data : any;
             try{
-                data = await this.GetDepotData();
+                data = await this.proxy.GetDepotData();
             }
             catch(error){
                 reject(error);
             }
 
+            log.log("Processing DepotData");
+
+            if(data.result != "SUCCESS"){
+                reject(`Server error, status was: ${data.result}`);
+                return;
+            }
+
+            const fileCount = data.groups.map((g:any) => g.files).reduce((a:any, b:any) => a.concat(b)).length;
+
             //@ts-ignore
             var progressBar = Utilities.GetNewLoadingPopup("Checking files for updates", global.mainWindow, reject);
             var detailStr = "Checking files ";
-            progressBar.detail = detailStr + `(${this.workerThreadCount}/${this.workerThreadCount}) workers left.`;
+            progressBar.detail = detailStr + `(${0}/${fileCount}) files checked.`;
 
-            var workerData = new Array<ChecksumWorkerData>();
-
-            if(data.result == "SUCCESS"){
-                for(var group of data.groups){
-                    var dir = group.directory.local;
-                    dir = dir.replace("Path_Mod", this.modPath);
-                    dir = path.normalize(dir);
-                    for(var fileData of group.files){
-                        let filePath = fileData[0];
-                        let hash = fileData[1];
-
-                        let remotePath = path.join(group.directory.remote, filePath.replace("\\", "/"));
-
-                        workerData.push(new ChecksumWorkerData( path.join(dir, filePath), hash,  remotePath));
-                    }
+            const processedWorkerData = await this.GenerateHashes(reject, data, progressBar, detailStr, fileCount);
+            
+            for(var processedData of processedWorkerData){
+                if(!processedData.ismatch){
+                    this.filesToUpdate.push(processedData);
                 }
             }
-            else{
-                reject(`Server error, status was: ${data.result}`);
-            }
 
-            //Setup workers to check and calculate checksums
-            var dataPerWorker = Math.ceil(workerData.length / this.workerThreadCount);
+            log.log("Processed DepotData");
+
+            progressBar.setCompleted();
+            resolve(this.filesToUpdate.length > 0);
+        });
+    }
+
+    private GenerateHashes(rejectParent: (reason?: any) => void, data: any, progressBar: any, detailStr: string, fileCount: any) {
+        return new Promise<ChecksumWorkerData[]>(async (resolve, reject) => {
+
             var processedWorkerData = new Array<ChecksumWorkerData>();
-            var runningWorkers = 0;
+            const workers = new Array<Worker>();
+            for (var i = 0; i < this.workerThreadCount; i++) {
+                const worker = this.SetupChecksumWorker(rejectParent);
+                workers.push(worker);
+            }
 
-            const ProcessWorkerResults = (filesToUpdate : ChecksumWorkerData[]) => {
-                for(var processedData of processedWorkerData){
-                    if(!processedData.ismatch){
-                        filesToUpdate.push(processedData);
+            let fileIndex = 0;
+            for (var group of data.groups) {
+                var dir = group.directory.local;
+                dir = dir.replace("Path_Mod", this.modPath);
+                dir = path.normalize(dir);
+                for (var fileData of group.files) {
+                    let filePath = fileData[0];
+                    let hash = fileData[1];
+
+                    let remotePath = path.join(group.directory.remote, filePath.replace("\\", "/"));
+                    const absoluteFilePath = path.join(dir, filePath);
+                    if (fs.existsSync(absoluteFilePath)) {
+                        const file = fs.readFileSync(absoluteFilePath);
+                        const data = new ChecksumWorkerData(absoluteFilePath, file, hash, remotePath);
+
+                        const { port1, port2 } = new MessageChannel();
+                        port1.on('message', (result) => {
+                            processedWorkerData.push(result);
+                            progressBar.detail = detailStr + `(${processedWorkerData.length}/${fileCount}) files checked.`;
+                            if (processedWorkerData.length == fileCount)
+                                resolve(processedWorkerData);
+                        });
+                        
+                        workers[fileIndex % this.workerThreadCount].postMessage({ port: port2, data: data }, [port2]);
                     }
+                    else {
+                        const data = new ChecksumWorkerData(absoluteFilePath, null, hash, remotePath);
+                        processedWorkerData.push(data);
+                    }
+
+                    fileIndex++;
                 }
-                progressBar.setCompleted();
-                resolve(filesToUpdate.length > 0);
-            };
-
-            for(var i = 0; i < this.workerThreadCount; i++){
-                let startIndex = dataPerWorker * i;
-                let endIndex = dataPerWorker * (i + 1);
-                let ourIndex = i;
-                let splicedWorkers = workerData.slice(startIndex, endIndex);
-                runningWorkers++;
-                //@ts-ignore
-                global.log.log("Starting Checksumworker no:" + i);
-                this.RunNewChecksumWorker(splicedWorkers).then(
-                (result : any) => {
-                    runningWorkers--;
-                    //@ts-ignore
-                    global.log.log(`Worker ${ourIndex} finished! ${runningWorkers} remain.`);
-                    progressBar.detail = detailStr + `(${runningWorkers}/${this.workerThreadCount}) workers left.`;
-                    processedWorkerData = processedWorkerData.concat(result.result);
-                    if(runningWorkers < 1) {
-                        //@ts-ignore
-                        global.log.log(`Workers done. Processing results.`);
-                        ProcessWorkerResults(this.filesToUpdate);
-                    }
-                }).catch(reject);
             }
         });
     }
 
-    async GetDepotData() : Promise<any> {
-        return new Promise((resolve, reject) => {
-            if(this.allDepotData == undefined){
-                var options = {
-                    headers: {
-                      'User-Agent': 'creators-tf-launcher'
-                    }
-                };
-    
-                var req = https.get(this.allContentURL, options, function (res : any) {
-                    if (res.statusCode !== 200) {
-                        let error = `Request failed, response code was: ${res.statusCode}`;
-                        reject(error);
-                    }
-                    else {  
-                        var data: any[] = [], dataLen = 0;
-        
-                        res.on("data", function (chunk: string | any[]) {
-                            data.push(chunk);
-                            dataLen += chunk.length;
-                        });
-        
-                        res.on("end", () => {
-                            var buf = Buffer.concat(data);
-    
-                            resolve(JSON.parse(buf.toString()));
-                        });
-                    }
-                });
-        
-                req.on("error", function (err : any) {
-                    reject(err.toString());
-                });
-    
-            }
-
-            else resolve(this.allDepotData);
-        });
+    private SetupChecksumWorker(reject : (reason?: any) => void) : Worker {
+        const worker = new Worker(path.join(__dirname, 'checksum_worker.js'));
+        worker.on('error', (e) => {
+                reject(e);
+            });
+        worker.on('exit', (code) => {
+                if (code !== 0)
+                    reject(new Error(`Worker stopped with exit code ${code}`));
+            });
+        return worker;
     }
 
     public async UpdateFiles(mainWindow : any, app : any, loadingTextStyle : any) : Promise<void> {
@@ -231,62 +211,20 @@ class CreatorsDepotClient {
     }
 
     //Start a download and write the first file from the queue. 
-    private UpdateNextFile(index : number, progressBar : any) {
+    private async UpdateNextFile(index : number, progressBar : any) {
         var fileToUpdate = this.filesToUpdate[index];
 
-        //Format request url, then fix the slashes used
-        let fileReqURL = strf(this.downloadRequestURL, fileToUpdate.remotePath);
-        fileReqURL = fileReqURL.replace(/\\/g,"/");
-
-        this.DownloadFile(fileReqURL, progressBar).then(
-            (fileBuffer) => {
-                this.WriteFile(fileToUpdate.filePath, fileBuffer);
-                this.currentDownloads--;
-            }
-        ).catch((e) => {throw new Error(e);});
         this.currentDownloads++;
-    }
-
-    private async DownloadFile(url : string, progressBar : any) : Promise<Buffer> {
-        return new Promise((resolve, reject) => {
-            //@ts-ignore
-            global.log.log(`Starting download for ${url}`);
-            var options = {
-                headers: {
-                  'User-Agent': 'creators-tf-launcher'
-                }
-            };
-    
-            var req = https.get(url, options, function (res : any) {
-                if (res.statusCode !== 200) {
-                    let error = `Request failed, response code was: ${res.statusCode}`;
-                    reject(error);
-                }
-                else {
-                    var data: any[] = [];
-    
-                    res.on("data", function (chunk: string | any[]) {
-                        data.push(chunk);
-                    });
-    
-                    res.on("end", () => {
-                        var buf = Buffer.concat(data);
-                        progressBar.detail = "Downloaded " + url;
-                        progressBar.value++;
-                        resolve(buf);
-                    });
-                }
-            });
-    
-            req.on("error", function (err : any) {
-                reject(new Error(err.toString()));
-            });
-        });
+        const fileBuffer = await this.proxy.DownloadFile(fileToUpdate.remotePath);
+        
+        progressBar.detail = "Downloaded " + fileToUpdate.remotePath;
+        progressBar.value++;
+        this.WriteFile(fileToUpdate.filePath, fileBuffer);
+        this.currentDownloads--;
     }
 
     private WriteFile(targetpath : string, data : Buffer){
-        //@ts-ignore
-        global.log.log(`Writing file "${targetpath}"`);
+        log.log(`Writing file "${targetpath}"`);
         let dir = path.dirname(targetpath);
 
         if(!fs.existsSync(dir)){
@@ -295,21 +233,6 @@ class CreatorsDepotClient {
         
         fs.writeFileSync(targetpath, data);
     }
-
-    private RunNewChecksumWorker(checksumWorkerData : ChecksumWorkerData[]) {
-        return new Promise((resolve, reject) => {
-          const worker = new Worker(path.join(__dirname, 'checksum_worker.js'), { workerData: checksumWorkerData });
-          worker.on('message', resolve);
-          worker.on('error', (e) => {
-              reject(e);
-            });
-          worker.on('exit', (code) => {
-            if (code !== 0)
-              reject(new Error(`Worker stopped with exit code ${code}`));
-          })
-        })
-    }
-
 }
 
 export {CreatorsDepotClient};
